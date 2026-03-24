@@ -1,47 +1,103 @@
 import sys
 import os
+import locale
+import ctypes
+import ctypes.util
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+# Must set LC_NUMERIC to "C" at the C level before importing mpv,
+# otherwise libmpv segfaults on macOS with non-C locales.
+locale.setlocale(locale.LC_NUMERIC, 'C')
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+libc.setlocale(ctypes.c_int(4), b'C')  # LC_NUMERIC = 4 on macOS
+
 import mpv
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog,
     QSizePolicy, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
 from max_bridge import MaxBridge
 from nine_band_eq_dialog import get_final_gains
 
 
-class MpvContainer(QWidget):
-    """A QWidget that hosts an embedded mpv player window."""
+def _get_process_address(_, name):
+    """Callback for mpv to resolve OpenGL function addresses."""
+    path = ctypes.util.find_library("OpenGL")
+    if not path:
+        return 0
+    lib = ctypes.cdll.LoadLibrary(path)
+    try:
+        return ctypes.cast(getattr(lib, name.decode('utf-8')), ctypes.c_void_p).value or 0
+    except AttributeError:
+        return 0
+
+get_process_address = mpv.MpvGlGetProcAddressFn(_get_process_address)
+
+
+class MpvContainer(QOpenGLWidget):
+    """A QOpenGLWidget that hosts an embedded mpv player via the render API."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.player = None
+        self._render_ctx = None
 
     def init_mpv(self):
         self.player = mpv.MPV(
-            wid=str(int(self.winId())),
             vo='libmpv',
             aid='no',
             keep_open='yes',
             osd_level=0,
             input_default_bindings=False,
             input_vo_keyboard=False,
+            log_handler=print,
+            loglevel='info',
         )
         self.player['sub-visibility'] = True
         self.player['sub-auto'] = 'fuzzy'
+
+    def initializeGL(self):
+        if self.player and not self._render_ctx:
+            self._render_ctx = mpv.MpvRenderContext(
+                self.player, 'opengl',
+                opengl_init_params={
+                    'get_proc_address': get_process_address,
+                }
+            )
+            self._render_ctx.update_cb = self._on_render_update
+
+    def _on_render_update(self):
+        # Schedule a repaint on the Qt thread
+        QTimer.singleShot(0, self.update)
+
+    def paintGL(self):
+        if self._render_ctx:
+            ratio = self.devicePixelRatioF()
+            w = int(self.width() * ratio)
+            h = int(self.height() * ratio)
+            fbo = self.defaultFramebufferObject()
+            self._render_ctx.render(flip_y=True, opengl_fbo={
+                'w': w, 'h': h, 'fbo': fbo,
+            })
+
+    def closeEvent(self, event):
+        if self._render_ctx:
+            self._render_ctx.free()
+            self._render_ctx = None
+        super().closeEvent(event)
 
 
 class AVMixer(QWidget):
     def __init__(self, output_device=None):
         super().__init__()
-        self.setWindowTitle("Mixer → Max (Voice, Music, SFX)")
+        self.setWindowTitle("Mixer → Max (DX, MX, SFX)")
         self.resize(1000, 600)
 
         self.pre_eq_gains = None
@@ -52,12 +108,12 @@ class AVMixer(QWidget):
         self.video_path = None
         self.subtitle_path = None
 
-        # IMPORTANT: audio files must be named this way
-        self.tracks = ["voice.wav", "music.wav", "foley.wav"]
+        self.stem_types = ["dx", "mx", "sfx"]
+        self.stem_labels = {"dx": "Dialogue", "mx": "Music", "sfx": "Sound Effects"}
         self.track_channels = {
-            "voice.wav": (0, 1),
-            "music.wav": (2, 3),
-            "foley.wav": (4, 5),
+            "dx": (0, 1),
+            "mx": (2, 3),
+            "sfx": (4, 5),
         }
 
         # OSC bridge to Max
@@ -66,17 +122,18 @@ class AVMixer(QWidget):
 
         self.output_device = output_device
         self.init_ui()
+
         QTimer.singleShot(100, self.start_pre_eq_phase)
 
     def init_ui(self):
         main_layout = QHBoxLayout()
         self.setLayout(main_layout)
 
-        # left side — embedded mpv video player
+        # left side — embedded mpv video player (OpenGL)
         self.mpv_widget = MpvContainer()
         self.mpv_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.mpv_widget.init_mpv()
         main_layout.addWidget(self.mpv_widget, stretch=2)
-        QTimer.singleShot(0, self.mpv_widget.init_mpv)
 
         # right side control panel
         controls_layout = QVBoxLayout()
@@ -97,8 +154,8 @@ class AVMixer(QWidget):
         controls_layout.addLayout(h_controls)
 
         # track controls
-        for t in self.tracks:
-            controls_layout.addWidget(QLabel(f"--- {t.upper()}"))
+        for t in self.stem_types:
+            controls_layout.addWidget(QLabel(f"--- {self.stem_labels[t]} ---"))
             self.sliders[t] = {}
 
             # volume and pan
@@ -242,48 +299,68 @@ class AVMixer(QWidget):
         mid = float(s["mid"].value())
         high = float(s["high"].value())
         freq_shift_val = (float(s["freq_shift"].value()) + 100.0) / 200.0
-        track_short = track_name.replace(".wav", "")
-        self.max_bridge.send_track_control(track_short, vol, pan, low, mid, high, freq_shift_val)
+        self.max_bridge.send_track_control(track_name, vol, pan, low, mid, high, freq_shift_val)
 
     def load_video_and_audio(self):
-        file_dialog = QFileDialog(self)
-        video_path, _ = file_dialog.getOpenFileName(
-            self, "Select Video File", "", "Video Files (*.mov *.mp4 *.avi)"
+        media_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+        if not os.path.isdir(media_dir):
+            media_dir = ""
+
+        video_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video File", media_dir, "Video Files (*.mov *.mp4 *.avi)"
         )
         if not video_path:
-            video_path = "video.mov"
+            return
 
         self.stop_all()
+        self._cleanup_stream()
         self.video_path = video_path
+        self.subtitle_path = None
         self.audio_buffers = {}
 
         # Auto-detect matching .srt subtitle file
         base, _ = os.path.splitext(video_path)
-        srt_path = base + '.srt'
-        if os.path.exists(srt_path):
-            self.subtitle_path = srt_path
-            print(f"Subtitles auto-detected: {srt_path}")
+        for ext in ('.srt', '.ass', '.vtt'):
+            sub_path = base + ext
+            if os.path.exists(sub_path):
+                self.subtitle_path = sub_path
+                print(f"Subtitles auto-detected: {sub_path}")
+                break
 
-        for name in self.tracks:
+        # Derive audio stem paths from the video filename prefix
+        # e.g., media/wildrobot.mp4 -> media/wildrobot-dx.wav, wildrobot-mx.wav, ...
+        video_dir = os.path.dirname(video_path)
+        prefix = os.path.splitext(os.path.basename(video_path))[0]
+
+        for stem in self.stem_types:
+            audio_path = os.path.join(video_dir, f"{prefix}-{stem}.wav")
             try:
-                data, sr = sf.read(name, always_2d=True)
+                data, sr = sf.read(audio_path, always_2d=True)
                 if data.ndim == 1:
                     data = np.repeat(data[:, None], 2, axis=1)
                 if data.shape[1] == 1:
                     data = np.repeat(data, 2, axis=1)
                 if data.shape[1] > 2:
                     data = data[:, :2]
-                self.audio_buffers[name] = {"data": data.astype(np.float32), "sr": sr, "idx": 0}
+                self.audio_buffers[stem] = {"data": data.astype(np.float32), "sr": sr, "idx": 0}
+                print(f"Loaded: {prefix}-{stem}.wav")
             except Exception as e:
-                print(f"Warning: could not load {name}: {e}")
+                print(f"Warning: could not load {prefix}-{stem}.wav: {e}")
 
         if self.audio_buffers:
             srs = {v["sr"] for v in self.audio_buffers.values()}
             if len(srs) != 1:
                 print("WARNING: Not all audio files share the same samplerate. Resample them for reliable playback.")
-            print(f"Video ({video_path}) and {len(self.audio_buffers)} audio tracks loaded.")
+            print(f"Video ({prefix}) and {len(self.audio_buffers)} audio tracks loaded.")
         else:
             print("Video loaded, but no audio tracks were found/loaded.")
+
+        # Load video into mpv (paused) so it's visible immediately
+        if self.mpv_widget.player:
+            self.mpv_widget.player.command('loadfile', video_path)
+            self.mpv_widget.player.pause = True
+            if self.subtitle_path:
+                QTimer.singleShot(200, self._add_subtitles)
 
     def load_subtitles(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -333,27 +410,25 @@ class AVMixer(QWidget):
             print("Audio files not loaded. Please load video and audio first.")
             return
         if not self.running:
-            self.running = True
-
-            # Start mpv video playback
-            if self.mpv_widget.player and self.video_path:
-                self.mpv_widget.player.command('loadfile', self.video_path)
-                if self.subtitle_path:
-                    QTimer.singleShot(200, self._add_subtitles)
-
-            for name in self.tracks:
-                if name in self.audio_buffers:
-                    self.audio_buffers[name]["idx"] = 0
-                self.request_coeff_update(name)
+            for stem in self.stem_types:
+                if stem in self.audio_buffers:
+                    self.audio_buffers[stem]["idx"] = 0
+                self.request_coeff_update(stem)
 
             if self.pre_eq_gains is not None:
                 self.max_bridge.send_pre_eq(self.pre_eq_gains)
 
+            # Seek video to start (while still paused)
+            if self.mpv_widget.player and self.video_path:
+                self.mpv_widget.player.command('seek', 0, 'absolute')
+
+            # Create audio stream (outputs silence until self.running = True)
+            self._cleanup_stream()
             sr = list(self.audio_buffers.values())[0]["sr"]
             try:
                 stream = sd.OutputStream(
                     samplerate=sr,
-                    blocksize=4096,
+                    blocksize=1024,
                     channels=6,
                     callback=self.audio_callback,
                     dtype="float32",
@@ -361,10 +436,16 @@ class AVMixer(QWidget):
                 )
                 stream.start()
                 self.stream = stream
-                print("Playback started: streaming 6 channels to virtual audio device.")
-                self.max_bridge.send_transport("play")
             except Exception as e:
                 print("Failed to start audio stream:", e)
+                return
+
+            # Enable audio and unpause video together
+            self.running = True
+            if self.mpv_widget.player and self.video_path:
+                self.mpv_widget.player.pause = False
+            print("Playback started.")
+            self.max_bridge.send_transport("play")
 
     def _add_subtitles(self):
         if self.mpv_widget.player and self.subtitle_path:
@@ -378,21 +459,29 @@ class AVMixer(QWidget):
             self.running = False
             if self.mpv_widget.player:
                 try:
-                    self.mpv_widget.player.command('stop')
+                    self.mpv_widget.player.pause = True
                 except Exception:
                     pass
-            if self.stream:
-                try:
-                    self.stream.stop()
-                    self.stream.close()
-                except Exception:
-                    pass
-                self.stream = None
+            self._cleanup_stream()
             print("Playback stopped.")
             self.max_bridge.send_transport("stop")
 
+    def _cleanup_stream(self):
+        """Fully stop and close the audio stream (for shutdown/reload)."""
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
     def closeEvent(self, event):
         self.stop_all()
+        self._cleanup_stream()
+        if self.mpv_widget._render_ctx:
+            self.mpv_widget._render_ctx.free()
+            self.mpv_widget._render_ctx = None
         if self.mpv_widget.player:
             self.mpv_widget.player.terminate()
         self.max_bridge.shutdown()
@@ -401,6 +490,9 @@ class AVMixer(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    # QApplication resets locale — force it back to C for libmpv
+    locale.setlocale(locale.LC_NUMERIC, 'C')
+    libc.setlocale(ctypes.c_int(4), b'C')
     win = AVMixer(output_device='BlackHole 64ch')
     win.show()
     sys.exit(app.exec())
