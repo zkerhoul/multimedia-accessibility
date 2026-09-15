@@ -1,97 +1,113 @@
 import sys
 import os
-import locale
-import ctypes
-import ctypes.util
+import re
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-
-# Must set LC_NUMERIC to "C" at the C level before importing mpv,
-# otherwise libmpv segfaults on macOS with non-C locales.
-locale.setlocale(locale.LC_NUMERIC, 'C')
-libc = ctypes.CDLL(ctypes.util.find_library('c'))
-libc.setlocale(ctypes.c_int(4), b'C')  # LC_NUMERIC = 4 on macOS
-
-import mpv
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog,
     QSizePolicy, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtCore import Qt, QUrl, QTimer
 
 from max_bridge import MaxBridge
 from nine_band_eq_dialog import get_final_gains
 
 
-def _get_process_address(_, name):
-    """Callback for mpv to resolve OpenGL function addresses."""
-    path = ctypes.util.find_library("OpenGL")
-    if not path:
-        return 0
-    lib = ctypes.cdll.LoadLibrary(path)
-    try:
-        return ctypes.cast(getattr(lib, name.decode('utf-8')), ctypes.c_void_p).value or 0
-    except AttributeError:
-        return 0
+def parse_srt(path):
+    """Parse an .srt file and return a list of (start_ms, end_ms, text) tuples."""
+    subtitles = []
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        content = f.read()
 
-get_process_address = mpv.MpvGlGetProcAddressFn(_get_process_address)
+    blocks = re.split(r'\n\s*\n', content.strip())
+    time_pattern = re.compile(
+        r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})'
+    )
+
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 2:
+            continue
+        for i, line in enumerate(lines):
+            match = time_pattern.search(line)
+            if match:
+                h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(x) for x in match.groups())
+                start_ms = h1 * 3600000 + m1 * 60000 + s1 * 1000 + ms1
+                end_ms = h2 * 3600000 + m2 * 60000 + s2 * 1000 + ms2
+                text = '\n'.join(lines[i + 1:]).strip()
+                # Strip basic HTML tags like <i>, <b>, etc.
+                text = re.sub(r'<[^>]+>', '', text)
+                if text:
+                    subtitles.append((start_ms, end_ms, text))
+                break
+
+    return subtitles
 
 
-class MpvContainer(QOpenGLWidget):
-    """A QOpenGLWidget that hosts an embedded mpv player via the render API."""
+class VideoContainer(QWidget):
+    """A QWidget containing a QVideoWidget with a subtitle label below."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.player = None
-        self._render_ctx = None
 
-    def init_mpv(self):
-        self.player = mpv.MPV(
-            vo='libmpv',
-            aid='no',
-            keep_open='yes',
-            osd_level=0,
-            input_default_bindings=False,
-            input_vo_keyboard=False,
-            log_handler=print,
-            loglevel='info',
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setLayout(layout)
+
+        self.video_widget = QVideoWidget()
+        layout.addWidget(self.video_widget, stretch=1)
+
+        self.subtitle_label = QLabel()
+        self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setMinimumHeight(60)
+        self.subtitle_label.setStyleSheet(
+            "QLabel {"
+            "  color: white;"
+            "  font-size: 18px;"
+            "  font-weight: bold;"
+            "  background-color: black;"
+            "  padding: 8px 12px;"
+            "}"
         )
-        self.player['sub-visibility'] = True
-        self.player['sub-auto'] = 'fuzzy'
+        self.subtitle_label.setText("")
+        layout.addWidget(self.subtitle_label)
 
-    def initializeGL(self):
-        if self.player and not self._render_ctx:
-            self._render_ctx = mpv.MpvRenderContext(
-                self.player, 'opengl',
-                opengl_init_params={
-                    'get_proc_address': get_process_address,
-                }
-            )
-            self._render_ctx.update_cb = self._on_render_update
+        # Transport controls
+        transport_layout = QHBoxLayout()
+        transport_layout.setContentsMargins(4, 4, 4, 4)
 
-    def _on_render_update(self):
-        # Schedule a repaint on the Qt thread
-        QTimer.singleShot(0, self.update)
+        self.rewind_btn = QPushButton("<< 5s")
+        self.play_pause_btn = QPushButton("Play")
+        self.ff_btn = QPushButton("5s >>")
 
-    def paintGL(self):
-        if self._render_ctx:
-            ratio = self.devicePixelRatioF()
-            w = int(self.width() * ratio)
-            h = int(self.height() * ratio)
-            fbo = self.defaultFramebufferObject()
-            self._render_ctx.render(flip_y=True, opengl_fbo={
-                'w': w, 'h': h, 'fbo': fbo,
-            })
+        for btn in (self.rewind_btn, self.play_pause_btn, self.ff_btn):
+            btn.setFixedHeight(28)
 
-    def closeEvent(self, event):
-        if self._render_ctx:
-            self._render_ctx.free()
-            self._render_ctx = None
-        super().closeEvent(event)
+        self.seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self.seek_slider.setRange(0, 0)
+
+        self.time_label = QLabel("0:00 / 0:00")
+        self.time_label.setStyleSheet("color: white; font-size: 12px;")
+        self.time_label.setFixedWidth(100)
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        transport_layout.addWidget(self.rewind_btn)
+        transport_layout.addWidget(self.play_pause_btn)
+        transport_layout.addWidget(self.ff_btn)
+        transport_layout.addWidget(self.seek_slider, stretch=1)
+        transport_layout.addWidget(self.time_label)
+
+        transport_widget = QWidget()
+        transport_widget.setLayout(transport_layout)
+        transport_widget.setStyleSheet("background-color: #333; color: white;")
+        layout.addWidget(transport_widget)
 
 
 class AVMixer(QWidget):
@@ -107,18 +123,31 @@ class AVMixer(QWidget):
         self.sliders = {}
         self.video_path = None
         self.subtitle_path = None
+        self.subtitles = []
+        self.paused = False
 
         self.stem_types = ["dx", "mx", "sfx"]
-        self.stem_labels = {"dx": "Dialogue", "mx": "Music", "sfx": "Sound Effects"}
+        self.stem_labels = {"dx": "Vocals/Dialogue", "mx": "Music", "sfx": "Sound Effects"}
         self.track_channels = {
             "dx": (0, 1),
             "mx": (2, 3),
             "sfx": (4, 5),
         }
 
+        # Qt media player (muted — audio goes through sounddevice → BlackHole → Max)
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(0.0)
+
         # OSC bridge to Max
         self.max_bridge = MaxBridge(send_port=8000, listen_port=8001)
         self.max_bridge.start_server()
+
+        # Subtitle update timer
+        self._sub_timer = QTimer()
+        self._sub_timer.setInterval(50)
+        self._sub_timer.timeout.connect(self._update_subtitles)
 
         self.output_device = output_device
         self.init_ui()
@@ -129,28 +158,31 @@ class AVMixer(QWidget):
         main_layout = QHBoxLayout()
         self.setLayout(main_layout)
 
-        # left side — embedded mpv video player (OpenGL)
-        self.mpv_widget = MpvContainer()
-        self.mpv_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.mpv_widget.init_mpv()
-        main_layout.addWidget(self.mpv_widget, stretch=2)
+        # left side — video player with subtitle overlay
+        self.video_container = VideoContainer()
+        self.video_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.player.setVideoOutput(self.video_container.video_widget)
+        main_layout.addWidget(self.video_container, stretch=2)
+
+        # Transport bar connections
+        self.video_container.play_pause_btn.clicked.connect(self.toggle_play_pause)
+        self.video_container.rewind_btn.clicked.connect(lambda: self.seek_relative(-5000))
+        self.video_container.ff_btn.clicked.connect(lambda: self.seek_relative(5000))
+        self.video_container.seek_slider.sliderMoved.connect(self.seek_to)
+        self.player.durationChanged.connect(self._on_duration_changed)
 
         # right side control panel
         controls_layout = QVBoxLayout()
 
         # control buttons
         load_button = QPushButton("Load Video/Audio")
-        load_subs_button = QPushButton("Load Subtitles (.srt)")
         pre_eq_button = QPushButton("Re-open 9-Band Pre-EQ")
-        play_button = QPushButton("Play")
-        stop_button = QPushButton("Stop")
 
         h_controls = QHBoxLayout()
         h_controls.addWidget(load_button)
-        h_controls.addWidget(load_subs_button)
         h_controls.addWidget(pre_eq_button)
-        h_controls.addWidget(play_button)
-        h_controls.addWidget(stop_button)
         controls_layout.addLayout(h_controls)
 
         # track controls
@@ -265,10 +297,7 @@ class AVMixer(QWidget):
 
         # button signals
         load_button.clicked.connect(self.load_video_and_audio)
-        load_subs_button.clicked.connect(self.load_subtitles)
         pre_eq_button.clicked.connect(self.start_pre_eq_phase)
-        play_button.clicked.connect(self.start_all)
-        stop_button.clicked.connect(self.stop_all)
 
     def start_pre_eq_phase(self):
         self.stop_all()
@@ -313,22 +342,22 @@ class AVMixer(QWidget):
             return
 
         self.stop_all()
-        self._cleanup_stream()
         self.video_path = video_path
         self.subtitle_path = None
+        self.subtitles = []
         self.audio_buffers = {}
 
-        # Auto-detect matching .srt subtitle file
+        # Auto-detect matching subtitle file
         base, _ = os.path.splitext(video_path)
         for ext in ('.srt', '.ass', '.vtt'):
             sub_path = base + ext
             if os.path.exists(sub_path):
                 self.subtitle_path = sub_path
-                print(f"Subtitles auto-detected: {sub_path}")
+                self.subtitles = parse_srt(sub_path)
+                print(f"Subtitles auto-detected: {sub_path} ({len(self.subtitles)} cues)")
                 break
 
         # Derive audio stem paths from the video filename prefix
-        # e.g., media/wildrobot.mp4 -> media/wildrobot-dx.wav, wildrobot-mx.wav, ...
         video_dir = os.path.dirname(video_path)
         prefix = os.path.splitext(os.path.basename(video_path))[0]
 
@@ -347,6 +376,19 @@ class AVMixer(QWidget):
             except Exception as e:
                 print(f"Warning: could not load {prefix}-{stem}.wav: {e}")
 
+        # Load video into QMediaPlayer
+        self.player.setSource(QUrl.fromLocalFile(video_path))
+
+        # Disable controls for missing stems, enable for loaded ones
+        for stem in self.stem_types:
+            loaded = stem in self.audio_buffers
+            for slider in self.sliders[stem].values():
+                if isinstance(slider, dict):
+                    continue
+                slider.setEnabled(loaded)
+            if not loaded:
+                self.sliders[stem]["vol"].setValue(0)
+
         if self.audio_buffers:
             srs = {v["sr"] for v in self.audio_buffers.values()}
             if len(srs) != 1:
@@ -355,25 +397,87 @@ class AVMixer(QWidget):
         else:
             print("Video loaded, but no audio tracks were found/loaded.")
 
-        # Load video into mpv (paused) so it's visible immediately
-        if self.mpv_widget.player:
-            self.mpv_widget.player.command('loadfile', video_path)
-            self.mpv_widget.player.pause = True
-            if self.subtitle_path:
-                QTimer.singleShot(200, self._add_subtitles)
-
     def load_subtitles(self):
+        media_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+        if not os.path.isdir(media_dir):
+            media_dir = ""
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Subtitle File", "", "Subtitle Files (*.srt *.ass *.sub *.vtt)"
+            self, "Select Subtitle File", media_dir, "Subtitle Files (*.srt *.ass *.sub *.vtt)"
         )
         if path:
             self.subtitle_path = path
-            if self.mpv_widget.player:
-                try:
-                    self.mpv_widget.player.command('sub-add', path, 'select')
-                except Exception as e:
-                    print(f"Error loading subtitles: {e}")
-            print(f"Subtitles loaded: {path}")
+            self.subtitles = parse_srt(path)
+            print(f"Subtitles loaded: {path} ({len(self.subtitles)} cues)")
+
+    def _update_subtitles(self):
+        """Update subtitle text and transport bar position."""
+        pos_ms = self.player.position()
+        dur_ms = self.player.duration()
+
+        # Update transport bar
+        slider = self.video_container.seek_slider
+        if not slider.isSliderDown():
+            slider.setValue(pos_ms)
+        self.video_container.time_label.setText(
+            f"{self._format_time(pos_ms)} / {self._format_time(dur_ms)}"
+        )
+
+        # Update subtitles
+        if not self.subtitles:
+            self.video_container.subtitle_label.hide()
+            return
+
+        current_text = ""
+        for start_ms, end_ms, text in self.subtitles:
+            if start_ms <= pos_ms <= end_ms:
+                current_text = text
+                break
+
+        self.video_container.subtitle_label.setText(current_text)
+
+    def _format_time(self, ms):
+        """Format milliseconds as m:ss or h:mm:ss."""
+        total_s = max(0, ms // 1000)
+        h, remainder = divmod(total_s, 3600)
+        m, s = divmod(remainder, 60)
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _on_duration_changed(self, duration_ms):
+        self.video_container.seek_slider.setRange(0, duration_ms)
+
+    def toggle_play_pause(self):
+        if not self.running:
+            self.start_all()
+        elif self.paused:
+            self.resume_playback()
+        else:
+            self.pause_playback()
+
+    def pause_playback(self):
+        self.paused = True
+        self.player.pause()
+        self.video_container.play_pause_btn.setText("Play")
+
+    def resume_playback(self):
+        self.paused = False
+        self.player.play()
+        self.video_container.play_pause_btn.setText("Pause")
+
+    def seek_to(self, position_ms):
+        self.player.setPosition(position_ms)
+        for buf in self.audio_buffers.values():
+            buf["idx"] = int(position_ms / 1000.0 * buf["sr"])
+
+    def seek_relative(self, offset_ms):
+        if not self.running:
+            return
+        current = self.player.position()
+        duration = self.player.duration()
+        new_pos = max(0, min(current + offset_ms, duration))
+        self.seek_to(new_pos)
 
     def audio_callback(self, outdata, frames, time_info, status):
         if status:
@@ -382,19 +486,22 @@ class AVMixer(QWidget):
         nch = 6
         mixed = np.zeros((blocksize, nch), dtype=np.float32)
 
-        if not self.running or not self.audio_buffers:
+        if not self.running or self.paused or not self.audio_buffers:
             outdata[:] = np.zeros_like(outdata)
             return
 
         for name, buf in self.audio_buffers.items():
             data = buf["data"]
             idx = buf["idx"]
+            if idx >= len(data):
+                # Past the end — output silence for this stem
+                continue
             if idx + blocksize > len(data):
-                wrap_len = len(data) - idx
+                # Partial block at end — pad with silence (no looping)
+                remaining = len(data) - idx
                 chunk = np.zeros((blocksize, 2), dtype=np.float32)
-                chunk[:wrap_len] = data[idx:]
-                chunk[wrap_len:] = data[:blocksize - wrap_len]
-                buf["idx"] = blocksize - wrap_len
+                chunk[:remaining] = data[idx:]
+                buf["idx"] = len(data)
             else:
                 chunk = data[idx:idx + blocksize].copy()
                 buf["idx"] = idx + blocksize
@@ -418,12 +525,7 @@ class AVMixer(QWidget):
             if self.pre_eq_gains is not None:
                 self.max_bridge.send_pre_eq(self.pre_eq_gains)
 
-            # Seek video to start (while still paused)
-            if self.mpv_widget.player and self.video_path:
-                self.mpv_widget.player.command('seek', 0, 'absolute')
-
-            # Create audio stream (outputs silence until self.running = True)
-            self._cleanup_stream()
+            # Create audio stream first (outputs silence while running=False)
             sr = list(self.audio_buffers.values())[0]["sr"]
             try:
                 stream = sd.OutputStream(
@@ -440,59 +542,46 @@ class AVMixer(QWidget):
                 print("Failed to start audio stream:", e)
                 return
 
-            # Enable audio and unpause video together
+            # Start audio first, then video after delay to compensate for
+            # BlackHole → Max audio pipeline latency
+            self.player.setPosition(0)
             self.running = True
-            if self.mpv_widget.player and self.video_path:
-                self.mpv_widget.player.pause = False
+            self.paused = False
+            self.video_container.play_pause_btn.setText("Pause")
+            QTimer.singleShot(250, self.player.play)
             print("Playback started.")
             self.max_bridge.send_transport("play")
 
-    def _add_subtitles(self):
-        if self.mpv_widget.player and self.subtitle_path:
-            try:
-                self.mpv_widget.player.command('sub-add', self.subtitle_path, 'select')
-            except Exception as e:
-                print(f"Error adding subtitles: {e}")
+            self._sub_timer.start()
 
     def stop_all(self):
         if self.running:
             self.running = False
-            if self.mpv_widget.player:
+            self.paused = False
+            self._sub_timer.stop()
+            self.video_container.subtitle_label.setText("")
+            self.video_container.play_pause_btn.setText("Play")
+            self.video_container.seek_slider.setValue(0)
+            self.video_container.time_label.setText("0:00 / 0:00")
+            self.player.stop()
+            if self.stream:
                 try:
-                    self.mpv_widget.player.pause = True
+                    self.stream.stop()
+                    self.stream.close()
                 except Exception:
                     pass
-            self._cleanup_stream()
+                self.stream = None
             print("Playback stopped.")
             self.max_bridge.send_transport("stop")
 
-    def _cleanup_stream(self):
-        """Fully stop and close the audio stream (for shutdown/reload)."""
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-
     def closeEvent(self, event):
         self.stop_all()
-        self._cleanup_stream()
-        if self.mpv_widget._render_ctx:
-            self.mpv_widget._render_ctx.free()
-            self.mpv_widget._render_ctx = None
-        if self.mpv_widget.player:
-            self.mpv_widget.player.terminate()
         self.max_bridge.shutdown()
         super().closeEvent(event)
 
 
 def main():
     app = QApplication(sys.argv)
-    # QApplication resets locale — force it back to C for libmpv
-    locale.setlocale(locale.LC_NUMERIC, 'C')
-    libc.setlocale(ctypes.c_int(4), b'C')
     win = AVMixer(output_device='BlackHole 64ch')
     win.show()
     sys.exit(app.exec())
